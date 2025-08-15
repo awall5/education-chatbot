@@ -10,10 +10,10 @@ from sentiment import analyze_sentiment_and_mood
 st.set_page_config(page_title="Edu Support RAG + Sentiment", page_icon="🎓", layout="wide")
 
 # --- Environment checks ---
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_KEY:
-    st.warning("⚠️ OPENAI_API_KEY is not set. Go to Render ➜ Environment ➜ add OPENAI_API_KEY.")
-    
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_KEY:
+    st.warning("⚠️ GEMINI_API_KEY is not set. Go to Render ➜ Environment ➜ add GEMINI_API_KEY.")
+
 st.title("🎓 Customer Support RAG (Education) with Sentiment & Escalation")
 st.caption("Retrieval-Augmented Generation • Real-time Sentiment • Empathetic Responses • Escalation Prediction")
 

@@ -7,7 +7,8 @@ import chromadb
 from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 
-from openai import OpenAI
+import google.generativeai as genai
+from sentence_transformers import SentenceTransformer
 
 @dataclass
 class RAGDoc:
@@ -21,31 +22,29 @@ class EduRAG:
         self.persist_dir = persist_dir
         self.collection_name = collection_name
         self.kb_path = kb_path
+
+        # ✅ Local embeddings from HuggingFace
+        self.embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+
         self.client = chromadb.PersistentClient(path=self.persist_dir, settings=Settings(allow_reset=True))
-        self.embedding_fn = embedding_functions.OpenAIEmbeddingFunction(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            model_name="text-embedding-3-small"
+        self.collection = self.client.get_or_create_collection(
+            name=self.collection_name,
+            metadata={"hnsw:space": "cosine"},
+            embedding_function=self._embed_text
         )
-        try:
-            self.collection = self.client.get_or_create_collection(
-                name=self.collection_name,
-                metadata={"hnsw:space": "cosine"},
-                embedding_function=self.embedding_fn
-            )
-        except Exception:
-            # If embedding function can't be bound (missing key), still create collection without EF.
-            self.collection = self.client.get_or_create_collection(
-                name=self.collection_name,
-                metadata={"hnsw:space": "cosine"},
-            )
         self._ensure_index_built()
 
-        self.oai = OpenAI()
+        # ✅ Gemini API setup
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        self.gemini_model = genai.GenerativeModel("gemini-pro")
+
+    def _embed_text(self, texts: List[str]):
+        if isinstance(texts, str):
+            texts = [texts]
+        return self.embed_model.encode(texts).tolist()
 
     def _ensure_index_built(self):
-        # If collection is empty, load KB
-        count = self.count()
-        if count == 0:
+        if self.count() == 0:
             self._load_kb()
 
     def rebuild(self):
@@ -56,16 +55,13 @@ class EduRAG:
         self.collection = self.client.get_or_create_collection(
             name=self.collection_name,
             metadata={"hnsw:space": "cosine"},
-            embedding_function=self.embedding_fn
+            embedding_function=self._embed_text
         )
         self._load_kb()
 
     def count(self) -> int:
         try:
-            # Chroma doesn't expose a direct count; run a dummy query
-            res = self.collection.get(limit=1)
-            total = len(self.collection.get()["ids"])
-            return total
+            return len(self.collection.get()["ids"])
         except Exception:
             return 0
 
@@ -76,7 +72,7 @@ class EduRAG:
         for i, d in enumerate(data):
             ids.append(str(i))
             docs.append(d["text"])
-            metas.append({"title": d["title"], "url": d.get("url","")})
+            metas.append({"title": d["title"], "url": d.get("url", "")})
         self.collection.add(ids=ids, documents=docs, metadatas=metas)
 
     def retrieve(self, query: str, k: int = 3) -> List[Dict]:
@@ -94,11 +90,8 @@ class EduRAG:
 
     def _build_system_prompt(self, domain: str = "education") -> str:
         return (
-            "You are an empathetic, factual, and helpful customer support assistant for the education domain "
-            "(universities, online learning, enrollment, exams, scholarships, student life). "
-            "You must ground each answer in the provided context snippets. "
-            "If context is missing, say so briefly and offer general guidance. "
-            "Use simple, supportive language and, when appropriate, step-by-step suggestions."
+            "You are an empathetic, factual, and helpful customer support assistant for the education domain. "
+            "Always base answers on the provided context snippets. If information is missing, say so and give general advice."
         )
 
     def generate_empathetic_answer(
@@ -106,7 +99,6 @@ class EduRAG:
         user_query: str,
         contexts: List[Dict],
         sentiment: Dict,
-        model: str = "gpt-4o-mini",
         temperature: float = 0.3,
         student_name: str = "",
         domain: str = "education",
@@ -116,41 +108,23 @@ class EduRAG:
         context_block = "\n\n".join([f"[{i+1}] {c['title']}\n{c['text']}" for i, c in enumerate(contexts)]) or "No relevant documents found."
 
         style = f"Sentiment: {sentiment.get('label')} (compound={sentiment.get('compound'):.2f}); Mood: {sentiment.get('mood')}."
-        tone = "Use an empathetic and reassuring tone. Acknowledge feelings briefly, then give clear, actionable steps."
-        escalation_note = "If escalation is suggested, include a short note: 'I've flagged this for a specialist to follow up.' " if escalate else ""
+        tone = "Use an empathetic and reassuring tone."
+        escalation_note = "I've flagged this for a specialist to follow up. " if escalate else ""
 
         name_line = f"Student name: {student_name}." if student_name else ""
 
-        messages = [
-            {"role":"system","content": system_prompt},
-            {"role":"user","content": (
-                f"{name_line}\n"
-                f"{style}\n"
-                f"{tone}\n"
-                f"{escalation_note}\n"
-                "User question:\n"
-                f"{user_query}\n\n"
-                "Use ONLY the context if possible. If something isn't in context, say so. "
-                "Cite context snippets like [1], [2] when used.\n\n"
-                f"Context Snippets:\n{context_block}"
-            )}
-        ]
-
-        resp = self.oai.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature
+        final_prompt = (
+            f"{system_prompt}\n\n{name_line}\n{style}\n{tone}\n{escalation_note}\n"
+            f"User question:\n{user_query}\n\nContext:\n{context_block}"
         )
 
-        text = resp.choices[0].message.content
-        usage = {
-            "prompt_tokens": resp.usage.prompt_tokens if hasattr(resp, "usage") else None,
-            "completion_tokens": resp.usage.completion_tokens if hasattr(resp, "usage") else None,
-            "total_tokens": resp.usage.total_tokens if hasattr(resp, "usage") else None,
-            "model": model
-        }
+        response = self.gemini_model.generate_content(final_prompt)
+        answer = response.text.strip() if hasattr(response, "text") else str(response)
+
+        usage = {"model": "gemini-pro"}
         scores = {
             "retrieved_k": len(contexts),
-            "avg_distance": (sum([c["score"] for c in contexts if isinstance(c.get("score"), (int,float))]) / max(1, sum([1 for c in contexts if isinstance(c.get('score'), (int,float))]))) if contexts else None
+            "avg_distance": (sum([c["score"] for c in contexts if isinstance(c.get("score"), (int,float))]) /
+                             max(1, sum([1 for c in contexts if isinstance(c.get("score"), (int,float))]))) if contexts else None
         }
-        return text, usage, scores
+        return answer, usage, scores
