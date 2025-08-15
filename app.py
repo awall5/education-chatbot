@@ -1,18 +1,12 @@
 import os
 import time
 import json
-import uuid
 import streamlit as st
 
 from rag_pipeline import EduRAG
 from sentiment import analyze_sentiment_and_mood
 
 st.set_page_config(page_title="Edu Support RAG + Sentiment", page_icon="🎓", layout="wide")
-
-# --- Environment checks ---
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_KEY:
-    st.warning("⚠️ GEMINI_API_KEY is not set. Go to Render ➜ Environment ➜ add GEMINI_API_KEY.")
 
 st.title("🎓 Customer Support RAG (Education) with Sentiment & Escalation")
 st.caption("Retrieval-Augmented Generation • Real-time Sentiment • Empathetic Responses • Escalation Prediction")
@@ -35,7 +29,6 @@ if "neg_streak" not in st.session_state:
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    model = st.selectbox("Generation model", ["gpt-4o-mini", "gpt-4o"], index=0)
     top_k = st.slider("Top-K documents", min_value=1, max_value=6, value=3)
     temperature = st.slider("Temperature", 0.0, 1.2, 0.3, 0.1)
     st.divider()
@@ -49,7 +42,7 @@ st.subheader("Ask a question")
 default_q = "How can I prepare for my semester exams while balancing part-time work?"
 query = st.text_input("Your question (education domain):", value=default_q)
 
-col1, col2 = st.columns([1,1])
+col1, col2 = st.columns([1, 1])
 with col1:
     user_name = st.text_input("Student name (optional):", value="Awal")
 with col2:
@@ -65,7 +58,6 @@ if st.button("Ask"):
     sent = analyze_sentiment_and_mood(query)
     compound = sent["compound"]
     label = sent["label"]
-    mood = sent["mood"]
 
     # Update negative streak
     if label == "negative":
@@ -73,17 +65,20 @@ if st.button("Ask"):
     else:
         st.session_state.neg_streak = 0
 
-    should_escalate = st.session_state.neg_streak >= 2 or compound <= -0.6 or (priority == "High" and label == "negative")
+    should_escalate = (
+        st.session_state.neg_streak >= 2
+        or compound <= -0.6
+        or (priority == "High" and label == "negative")
+    )
 
     # 2) Retrieve
     contexts = rag.retrieve(query, k=top_k)
 
-    # 3) Generate
+    # 3) Generate (no model arg — uses local flan-t5-base)
     answer, usage, scores = rag.generate_empathetic_answer(
         user_query=query,
         contexts=contexts,
         sentiment=sent,
-        model=model,
         temperature=temperature,
         student_name=user_name,
         domain="education",
@@ -92,8 +87,12 @@ if st.button("Ask"):
     latency = time.time() - start
 
     # Save history
-    st.session_state.history.append({"role":"user", "text":query, "sentiment":sent})
-    st.session_state.history.append({"role":"assistant", "text":answer, "meta":{"latency":latency, "usage":usage, "scores":scores, "escalate":should_escalate}})
+    st.session_state.history.append({"role": "user", "text": query, "sentiment": sent})
+    st.session_state.history.append({
+        "role": "assistant",
+        "text": answer,
+        "meta": {"latency": latency, "usage": usage, "scores": scores, "escalate": should_escalate}
+    })
 
 # --- Conversation display ---
 st.divider()
@@ -108,11 +107,13 @@ for turn in st.session_state.history:
         st.markdown(f"**🤖 Assistant:** {turn['text']}")
         meta = turn.get("meta", {})
         if meta:
-            usage = meta.get("usage", {})
-            scores = meta.get("scores", {})
-            esc = meta.get("escalate", False)
             with st.expander("Details"):
-                st.write({"latency_s": round(meta.get("latency", 0), 2), **usage, **scores, "escalate": esc})
+                st.write({
+                    "latency_s": round(meta.get("latency", 0), 2),
+                    **meta.get("usage", {}),
+                    **meta.get("scores", {}),
+                    "escalate": meta.get("escalate", False)
+                })
 
 # --- Diagnostic panel ---
 st.divider()
@@ -123,5 +124,5 @@ with colA:
 with colB:
     st.metric("KB Documents", rag.count())
 with colC:
-    st.metric("Index Path", os.getenv("CHROMA_DIR","./chroma_db"))
-st.caption("Escalation triggers: 2× consecutive negatives, very negative tone (≤ −0.6), or High priority + negative.") 
+    st.metric("Index Path", os.getenv("CHROMA_DIR", "./chroma_db"))
+st.caption("Escalation triggers: 2× consecutive negatives, very negative tone (≤ −0.6), or High priority + negative.")

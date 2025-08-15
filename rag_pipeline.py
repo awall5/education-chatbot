@@ -5,9 +5,7 @@ from dataclasses import dataclass
 
 import chromadb
 from chromadb.config import Settings
-from chromadb.utils import embedding_functions
-
-import google.generativeai as genai
+from transformers import pipeline
 from sentence_transformers import SentenceTransformer
 
 @dataclass
@@ -23,9 +21,13 @@ class EduRAG:
         self.collection_name = collection_name
         self.kb_path = kb_path
 
-        # ✅ Local embeddings from HuggingFace
+        # Local embeddings
         self.embed_model = SentenceTransformer("all-MiniLM-L6-v2")
 
+        # Local text generation model (Q&A style)
+        self.qa_pipeline = pipeline("text2text-generation", model="google/flan-t5-base")
+
+        # Chroma setup
         self.client = chromadb.PersistentClient(path=self.persist_dir, settings=Settings(allow_reset=True))
         self.collection = self.client.get_or_create_collection(
             name=self.collection_name,
@@ -33,10 +35,6 @@ class EduRAG:
             embedding_function=self._embed_text
         )
         self._ensure_index_built()
-
-        # ✅ Gemini API setup
-        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        self.gemini_model = genai.GenerativeModel("gemini-pro")
 
     def _embed_text(self, texts: List[str]):
         if isinstance(texts, str):
@@ -88,12 +86,6 @@ class EduRAG:
             })
         return out
 
-    def _build_system_prompt(self, domain: str = "education") -> str:
-        return (
-            "You are an empathetic, factual, and helpful customer support assistant for the education domain. "
-            "Always base answers on the provided context snippets. If information is missing, say so and give general advice."
-        )
-
     def generate_empathetic_answer(
         self,
         user_query: str,
@@ -104,24 +96,25 @@ class EduRAG:
         domain: str = "education",
         escalate: bool = False,
     ) -> Tuple[str, Dict, Dict]:
-        system_prompt = self._build_system_prompt(domain)
+        system_prompt = (
+            "You are an empathetic, helpful customer support assistant for the education domain. "
+            "Always base answers on the provided context. If context is missing, say so briefly."
+        )
         context_block = "\n\n".join([f"[{i+1}] {c['title']}\n{c['text']}" for i, c in enumerate(contexts)]) or "No relevant documents found."
 
-        style = f"Sentiment: {sentiment.get('label')} (compound={sentiment.get('compound'):.2f}); Mood: {sentiment.get('mood')}."
-        tone = "Use an empathetic and reassuring tone."
-        escalation_note = "I've flagged this for a specialist to follow up. " if escalate else ""
-
+        style = f"Sentiment: {sentiment.get('label')} | Mood: {sentiment.get('mood')}."
+        escalation_note = "This query may need escalation to a specialist. " if escalate else ""
         name_line = f"Student name: {student_name}." if student_name else ""
 
         final_prompt = (
-            f"{system_prompt}\n\n{name_line}\n{style}\n{tone}\n{escalation_note}\n"
-            f"User question:\n{user_query}\n\nContext:\n{context_block}"
+            f"{system_prompt}\n{name_line}\n{style}\n{escalation_note}\n"
+            f"Question: {user_query}\n\nContext:\n{context_block}"
         )
 
-        response = self.gemini_model.generate_content(final_prompt)
-        answer = response.text.strip() if hasattr(response, "text") else str(response)
+        result = self.qa_pipeline(final_prompt, max_new_tokens=256, temperature=temperature)
+        answer = result[0]['generated_text']
 
-        usage = {"model": "gemini-pro"}
+        usage = {"model": "flan-t5-base (local)"}
         scores = {
             "retrieved_k": len(contexts),
             "avg_distance": (sum([c["score"] for c in contexts if isinstance(c.get("score"), (int,float))]) /
